@@ -1,222 +1,186 @@
 """
 ResearchAgent — CORE-Bench purple agent.
 
-Workflow per task:
-  1. Parse incoming message (may contain paper text + repo path/zip URL).
-  2. Set up a per-task workspace (temp dir that persists across turns in same context).
-  3. Run an OpenAI tool-calling loop:
-       - Explore the workspace (list files, read README/requirements)
-       - Understand what results need to be reproduced
-       - Install dependencies & run code
-       - Capture outputs and compare with expected results
-       - Call report_results() to finalize
-  4. Return results as an artifact.
+Real CORE-Bench protocol (discovered from ab-shetty/agentbeats-corebench):
+
+  The green agent OWNS the code/data environment.
+  It exposes tools (execute_bash, inspect_file_as_text, etc.) by parsing
+  <json>...</json> tags from the purple agent's TEXT responses.
+
+  Conversation flow (multi-turn A2A, same context_id):
+    Turn 1:  Green → "Task description + available tools + instructions"
+             Purple → "<json>{"name": "execute_bash", "arguments": {"command": "ls"}}</json>"
+    Turn 2:  Green → "Exit Code: 0\ncode/ data/ results/"
+             Purple → "<json>{"name": "inspect_file_as_text", ...}</json>"
+    Turn N:  Green → "file contents..."
+             Purple → "<json>{"name": "FINAL_ANSWER", "arguments": {"content": {"Q?": "A"}}}</json>"
+
+  So the purple agent:
+  1. Maintains full conversation history across A2A turns (via context_id)
+  2. Each run() call = one LLM decision turn
+  3. Outputs a TEXT response with a <json>...</json> block (one tool call at a time)
+  4. When FINAL_ANSWER is detected → emit DataPart artifact + complete
 """
 
 import json
 import os
-import shutil
-import tempfile
-from pathlib import Path
+import re
+from typing import Any
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
 from a2a.server.tasks import TaskUpdater
-from a2a.types import DataPart, Message, Part, TaskState
+from a2a.types import DataPart, Message, Part, TaskState, TextPart
 from a2a.utils import get_message_text, new_agent_text_message
-
-from tools import TOOLS, dispatch_tool
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# System prompt
+# System prompt — teaches the model the <json> tool-call format
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a research reproduction agent competing in CORE-Bench (Computational Reproducibility Benchmark).
+SYSTEM_PROMPT = """You are a research reproduction agent for CORE-Bench (Computational Reproducibility Benchmark).
 
-Your goal: given a scientific paper's code repository, reproduce its key computational results.
+## Your situation
+- You are inside a scientific paper's code repository (CodeOcean capsule).
+- You have access to tools provided by the evaluation system.
+- Tools are executed by the evaluator — you call them by outputting JSON.
 
-## Workflow
+## How to call tools
+Output EXACTLY ONE tool call per message, wrapped in <json>...</json> tags:
 
-### Step 1 — Get the code
-If the task provides a GitHub URL or zip link, call clone_repo() first.
-Otherwise the repo is already in the workspace.
+<json>
+{"name": "execute_bash", "arguments": {"command": "ls -la"}}
+</json>
 
-### Step 2 — Explore
-- list_files('.', recursive=True) to see the full structure
-- Read these files (if they exist): README.md, REPRODUCE.md, run.sh, Makefile,
-  requirements.txt, environment.yml, setup.py, pyproject.toml
-- Identify the language (Python/R/Julia/etc.) and entry points
+Available tools (the evaluator will list them in the task):
+- execute_bash: Run shell commands. Use `cd dir && command` to chain (state is NOT preserved).
+- inspect_file_as_text: Read file contents as text.
+- query_vision_language_model: Analyze plots/images from the paper.
+- web_search: Search for documentation if needed.
 
-### Step 3 — Understand what to reproduce
-- Read the task description carefully — it specifies WHICH metrics/tables to reproduce
-- Note expected values (numbers, percentages, p-values, accuracy scores, etc.)
+## How to submit final answer
+When you have all answers, output:
 
-### Step 4 — Setup environment
-- Python: `pip install -r requirements.txt` (timeout 180s)
-- R: `Rscript -e "install.packages(...)"`
-- Conda env.yml: `conda env create -f environment.yml && conda run -n <env> ...`
-- If setup fails, try installing packages one by one or find minimal subset
+<json>
+{"name": "FINAL_ANSWER", "arguments": {"content": {"Exact question text?": "exact_value", ...}}}
+</json>
 
-### Step 5 — Execute
-- Run main script(s) per README instructions
-- Capture ALL output: stdout, stderr, result files (.csv, .json, .txt, .log)
-- If a run fails: read the error, fix it, retry
-- For long-running jobs: use timeout_seconds=600 or more
-- Look for pre-computed results if full training is infeasible
+## Strategy for CORE-Bench tasks
 
-### Step 6 — Extract metrics
-- search_in_files() for metric names, table numbers, or specific values
-- Read result files directly
-- Parse stdout for printed metrics
+### Easy (read results dir):
+1. `execute_bash` → `ls environment/results/` or `find . -name "*.csv" -o -name "*.json"`
+2. Read each result file with `inspect_file_as_text`
+3. Extract the specific values asked for
+4. Submit FINAL_ANSWER
 
-### Step 7 — Report
-- Call report_results() with reproduced_values and expected_values
-- Be precise: include exact numbers, not just "similar"
-- Even partial results are valuable — report what you got
+### Medium (reproduce with REPRODUCING.md):
+1. Read REPRODUCING.md: `inspect_file_as_text` → path="REPRODUCING.md"
+2. Follow the exact steps (install deps, run commands)
+3. Chain commands: `cd code && pip install -r requirements.txt && python run.py`
+4. Capture output and extract metrics
+5. Submit FINAL_ANSWER
 
-## Key rules
-- Work ONLY inside the workspace directory (no absolute paths outside it)
-- Always call report_results() at the end, even on failure
-- If a command takes >120s, re-issue with higher timeout_seconds
-- Don't guess results — only report what you actually measured
-- If code requires GPU/large data and fails, document this in errors[]
+### Hard (no instructions — figure it out):
+1. List all files: `execute_bash` → `find . -maxdepth 3 -type f | head -50`
+2. Read README, setup.py, requirements.txt
+3. Find main entry point (main.py, run.py, Makefile)
+4. Install deps and run
+5. Parse outputs for the requested metrics
+6. Submit FINAL_ANSWER
+
+## Critical rules
+- Answer keys MUST match the question text EXACTLY (copy-paste)
+- Answer values MUST be real extracted values — no guesses, no summaries
+- ONE tool call per response
+- If a command fails, read the error and try a fix
+- Always submit FINAL_ANSWER even if some values are "unknown"
 """
 
-# Max tool-calling iterations before giving up
-MAX_ITERATIONS = 30
+# Regex to extract <json>...</json> block from model output
+JSON_TAG_RE = re.compile(r"<json>\s*(.*?)\s*</json>", re.DOTALL)
 
 
 class ResearchAgent:
     def __init__(self):
         self.model = os.getenv("AGENT_MODEL", "gpt-4o-mini")
         self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        # Workspace persists for the lifetime of this agent instance (one context)
-        self._workspace: Path | None = None
+        # Full conversation history for this context (multi-turn)
         self.messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        self._final_result: dict | None = None
-
-    @property
-    def workspace(self) -> Path:
-        if self._workspace is None:
-            self._workspace = Path(tempfile.mkdtemp(prefix="agentx_research_"))
-        return self._workspace
-
-    def cleanup(self):
-        if self._workspace and self._workspace.exists():
-            shutil.rmtree(self._workspace, ignore_errors=True)
-            self._workspace = None
+        self.turn = 0
 
     # ------------------------------------------------------------------
-    # Main entry point
+    # Called on every A2A message in this context
     # ------------------------------------------------------------------
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         input_text = get_message_text(message)
+        self.turn += 1
 
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message(f"Starting research reproduction... workspace={self.workspace}"),
+            new_agent_text_message(f"[turn {self.turn}] Processing..."),
         )
 
-        # Append user turn
+        # Append the incoming message (task description or tool result from green agent)
         self.messages.append({"role": "user", "content": input_text})
 
-        # Agentic loop
-        result = await self._run_loop(updater)
-
-        # Return artifact
-        from a2a.types import DataPart, Part
-        await updater.add_artifact(
-            parts=[Part(root=DataPart(data=result))],
-            name="ReproductionResult",
+        # One LLM call per turn
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=self.messages,
+            temperature=0.0,
+            max_tokens=2048,
         )
 
-    # ------------------------------------------------------------------
-    # Agentic loop
-    # ------------------------------------------------------------------
+        assistant_text = response.choices[0].message.content or ""
+        self.messages.append({"role": "assistant", "content": assistant_text})
 
-    async def _run_loop(self, updater: TaskUpdater) -> dict:
-        for iteration in range(MAX_ITERATIONS):
+        # Parse the <json>...</json> block
+        action = _parse_json_action(assistant_text)
+
+        if action and action.get("name") == "FINAL_ANSWER":
+            # Emit answer as DataPart artifact
+            content = action.get("arguments", {}).get("content", {})
             await updater.update_status(
                 TaskState.working,
-                new_agent_text_message(f"[step {iteration + 1}] Calling model..."),
+                new_agent_text_message(f"[turn {self.turn}] Submitting FINAL_ANSWER with {len(content)} keys"),
             )
-
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=self.messages,
-                tools=TOOLS,
-                tool_choice="auto",
-                temperature=0.0,
-                max_tokens=4096,
+            await updater.add_artifact(
+                parts=[Part(root=DataPart(data={
+                    "final_answer": content,
+                    "turns": self.turn,
+                }))],
+                name="FinalAnswer",
             )
+            await updater.complete()
 
-            choice = response.choices[0]
-            assistant_msg = choice.message
+        else:
+            # Regular tool call — return text so green agent can parse <json> and execute
+            await updater.update_status(
+                TaskState.working,
+                new_agent_text_message(
+                    f"[turn {self.turn}] Tool call: {action.get('name', '?') if action else 'text response'}"
+                ),
+            )
+            await updater.add_artifact(
+                parts=[Part(root=TextPart(kind="text", text=assistant_text))],
+                name=f"ToolCall_t{self.turn}",
+            )
+            # Don't call updater.complete() — green agent will send the next message
 
-            # Append assistant message to history
-            self.messages.append(assistant_msg.model_dump(exclude_none=True))
 
-            # ── Finished: no more tool calls ──────────────────────────
-            if choice.finish_reason == "stop":
-                # Model gave a text answer without calling report_results
-                return {
-                    "success": False,
-                    "match_summary": assistant_msg.content or "(no response)",
-                    "reproduced_values": {},
-                    "errors": ["Agent stopped without calling report_results"],
-                }
+# ---------------------------------------------------------------------------
+# Helper
+# ---------------------------------------------------------------------------
 
-            # ── Tool calls ────────────────────────────────────────────
-            if not assistant_msg.tool_calls:
-                break
-
-            tool_results = []
-            for tc in assistant_msg.tool_calls:
-                tool_name = tc.function.name
-                try:
-                    tool_args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    tool_args = {}
-
-                await updater.update_status(
-                    TaskState.working,
-                    new_agent_text_message(f"[tool] {tool_name}({list(tool_args.keys())})"),
-                )
-
-                # report_results is terminal
-                if tool_name == "report_results":
-                    self._final_result = tool_args
-                    tool_results.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": "Results recorded. Task complete.",
-                    })
-                    self.messages.extend(tool_results)
-                    return tool_args  # ← exit loop early
-
-                # All other tools
-                result_str = dispatch_tool(self.workspace, tool_name, tool_args)
-
-                # Truncate very long results before adding to history
-                if len(result_str) > 6000:
-                    result_str = result_str[:6000] + "\n... (output truncated)"
-
-                tool_results.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result_str,
-                })
-
-            self.messages.extend(tool_results)
-
-        # Exhausted iterations
-        return {
-            "success": False,
-            "match_summary": "Agent exhausted max iterations without completing reproduction",
-            "reproduced_values": {},
-            "errors": [f"Hit MAX_ITERATIONS={MAX_ITERATIONS}"],
-        }
+def _parse_json_action(text: str) -> dict[str, Any] | None:
+    """Extract and parse the first <json>...</json> block."""
+    match = JSON_TAG_RE.search(text)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
