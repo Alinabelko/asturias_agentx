@@ -11,7 +11,7 @@ SERVER="root@135.181.40.162"
 REMOTE_DIR="/opt/agentx"
 PORT=9019
 CONTAINER="agentx-research"
-IMAGE="${DOCKER_IMAGE:-alinabelko/agentx-research:latest}"
+IMAGE="alinabelko/agentx-research:latest"
 
 echo "==> Копируем код на сервер..."
 ssh "$SERVER" "mkdir -p $REMOTE_DIR"
