@@ -48,7 +48,7 @@ class ResearchAgent:
                 messages=self.messages,
                 temperature=0.0,
                 response_format={"type": "json_object"},
-                max_tokens=1024,
+                max_completion_tokens=1024,
             )
             content = completion.choices[0].message.content or "{}"
             result = json.loads(content)
