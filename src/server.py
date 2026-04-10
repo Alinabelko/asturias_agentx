@@ -15,7 +15,7 @@ from executor import Executor
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CORE-Bench research reproduction purple agent")
+    parser = argparse.ArgumentParser(description="tau2-bench customer service purple agent")
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=9019)
     parser.add_argument("--card-url", type=str, help="Public URL for agent card")
@@ -25,20 +25,20 @@ def main():
     os.environ.setdefault("AGENT_MODEL", args.model)
 
     skill = AgentSkill(
-        id="research_reproduction",
-        name="Research Reproduction",
+        id="task_fulfillment",
+        name="Task Fulfillment",
         description=(
-            "Reproduces computational results from scientific papers. "
-            "Given a paper and its associated code/data repository, "
-            "the agent executes the code and verifies that results match the paper's claims."
+            "Customer service agent for tau2-bench evaluation. "
+            "Handles telecom, airline, retail and other service domains. "
+            "Uses tools and responds to users following provided policy."
         ),
-        tags=["research", "reproducibility", "core-bench", "science"],
+        tags=["benchmark", "tau2", "customer-service"],
         examples=[],
     )
 
     agent_card = AgentCard(
-        name="research_reproduction_agent",
-        description="CORE-Bench agent: reproduces scientific paper results from code and data",
+        name="tau2_agent",
+        description="Customer service agent for tau2-bench evaluation",
         url=args.card_url or f"http://{args.host}:{args.port}/",
         version="1.0.0",
         default_input_modes=["text"],
@@ -57,7 +57,7 @@ def main():
         http_handler=request_handler,
     )
 
-    print(f"Starting research agent on {args.host}:{args.port} | model={os.environ['AGENT_MODEL']}")
+    print(f"Starting tau2 agent on {args.host}:{args.port} | model={os.environ['AGENT_MODEL']}")
     uvicorn.run(
         app.build(),
         host=args.host,
