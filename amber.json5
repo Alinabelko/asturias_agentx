@@ -8,7 +8,7 @@
     image: "alinabelko/agentx-research:latest",
     env: {
       OPENAI_API_KEY: "${config.openai_api_key}",
-      AGENT_MODEL: "gpt-5.4-min",
+      AGENT_MODEL: "gpt-5.4-mini",
     },
     network: {
       endpoints: [
