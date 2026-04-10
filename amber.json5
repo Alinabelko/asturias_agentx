@@ -1,14 +1,24 @@
 {
   manifest_version: "0.1.0",
-  config: {
-    openai_api_key: { type: "string", secret: true },
-    model: { type: "string", default: "gpt-5.4-mini" },
+  config_schema: {
+    type: "object",
+    properties: {
+      openai_api_key: { type: "string" },
+      model: { type: "string" },
+    },
+    required: ["openai_api_key"],
+    additionalProperties: false,
   },
   program: {
-    image: "alinabelko/agentx-research:latest",
+    image: "docker.io/alinabelko/agentx-research:latest",
+    entrypoint: [
+      "python", "src/server.py",
+      "--host", "0.0.0.0",
+      "--port", "9019",
+    ],
     env: {
       OPENAI_API_KEY: "${config.openai_api_key}",
-      AGENT_MODEL: "gpt-5.4-mini",
+      AGENT_MODEL: "${config.model}",
     },
     network: {
       endpoints: [
